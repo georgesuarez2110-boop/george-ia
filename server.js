@@ -5,18 +5,24 @@ const path = require("path");
 const ROOT = __dirname;
 const PUBLIC_DIR = path.join(ROOT, "public");
 const PORT = Number(process.env.PORT) || 3000;
-const MODEL = process.env.MODEL || "gemini-2.5-flash";
-const FALLBACK_MODEL = "gemini-2.5-flash-lite";
+const MODEL = process.env.MODEL || "gemini-3.5-flash-lite";
+const FALLBACK_MODEL = process.env.FALLBACK_MODEL || "gemini-3.8-flash";
 const API_BASE = process.env.API_BASE || "https://generativelanguage.googleapis.com/v1beta";
 const MAX_MESSAGES = 30;
 const MAX_CHARS = 8000;
 const LIMIT_PER_MINUTE = 20;
+const MAX_BODY = 28 * 1024 * 1024;
+const MAX_ATTACH = 5;
+const MAX_TEXT_FILE = 120000;
+const MAX_TOTAL_DATA = 18 * 1024 * 1024;
+const ATTACH_MIMES = new Set(["image/png", "image/jpeg", "image/webp", "image/heic", "image/heif", "application/pdf"]);
 
 const SYSTEM_PROMPT = `Eres George IA, un asistente de inteligencia artificial amable, claro y directo.
 Respondes siempre en el idioma en que te escribe la persona, por defecto en español.
 Das respuestas útiles y bien organizadas, sin rodeos. Puedes usar formato Markdown: títulos, listas, negritas y bloques de código con su lenguaje.
 Si no sabes algo, lo dices. Si te preguntan quién eres, respondes que eres George IA.
-Si te piden una imagen o un dibujo, diles que escriban «crea una imagen de…» o pulsen el botón Imagen.`;
+Si te piden una imagen o un dibujo, diles que escriban «crea una imagen de…» o pulsen el botón Imagen.
+Puedes ver las fotos y leer los PDF y archivos de texto o código que la persona adjunte; úsalos para responder.`;
 
 const IMAGE_INSTRUCTIONS = `Eres un ilustrador digital. Crea la imagen pedida como un único archivo SVG.
 Reglas: responde solo con el código SVG, sin texto antes ni después y sin bloques de markdown.
@@ -59,21 +65,37 @@ function tooMany(ip) {
   return recent.length > LIMIT_PER_MINUTE;
 }
 
+function cleanAttachments(list, budget) {
+  if (!Array.isArray(list)) return [];
+  const out = [];
+  for (const a of list.slice(0, MAX_ATTACH)) {
+    if (!a || typeof a.name !== "string") continue;
+    const name = a.name.slice(0, 120);
+    if (typeof a.text === "string") {
+      out.push({ name, text: a.text.slice(0, MAX_TEXT_FILE) });
+    } else if (typeof a.data === "string" && ATTACH_MIMES.has(a.mime) && a.data.length <= budget.left) {
+      budget.left -= a.data.length;
+      out.push({ name, mime: a.mime, data: a.data });
+    }
+  }
+  return out;
+}
+
 function cleanMessages(input) {
   if (!Array.isArray(input)) return null;
-  const list = input
-    .filter(
-      (m) =>
-        m &&
-        (m.role === "user" || m.role === "assistant") &&
-        typeof m.content === "string" &&
-        m.content.trim() !== ""
-    )
-    .map((m) => ({ role: m.role, content: m.content.slice(0, MAX_CHARS) }))
-    .slice(-MAX_MESSAGES);
-  while (list.length && list[0].role !== "user") list.shift();
-  if (!list.length || list[list.length - 1].role !== "user") return null;
-  return list;
+  const budget = { left: MAX_TOTAL_DATA };
+  const list = [];
+  for (const m of input) {
+    if (!m || (m.role !== "user" && m.role !== "assistant")) continue;
+    const content = typeof m.content === "string" ? m.content.slice(0, MAX_CHARS) : "";
+    const attachments = m.role === "user" ? cleanAttachments(m.attachments, budget) : [];
+    if (content.trim() === "" && !attachments.length) continue;
+    list.push({ role: m.role, content, attachments });
+  }
+  const recent = list.slice(-MAX_MESSAGES);
+  while (recent.length && recent[0].role !== "user") recent.shift();
+  if (!recent.length || recent[recent.length - 1].role !== "user") return null;
+  return recent;
 }
 
 function sendJson(res, status, data) {
@@ -87,7 +109,7 @@ function readBody(req) {
     const chunks = [];
     req.on("data", (chunk) => {
       size += chunk.length;
-      if (size > 1000000) {
+      if (size > MAX_BODY) {
         reject(new Error("too large"));
         req.destroy();
         return;
@@ -118,10 +140,20 @@ function serveStatic(req, res) {
 }
 
 function toContents(messages) {
-  return messages.map((m) => ({
-    role: m.role === "assistant" ? "model" : "user",
-    parts: [{ text: m.content }]
-  }));
+  return messages.map((m) => {
+    const parts = [];
+    if (m.content && m.content.trim()) parts.push({ text: m.content });
+    for (const a of m.attachments || []) {
+      if (typeof a.text === "string") {
+        parts.push({ text: "Contenido del archivo «" + a.name + "»:\n" + a.text });
+      } else {
+        parts.push({ text: "Archivo adjunto: " + a.name });
+        parts.push({ inlineData: { mimeType: a.mime, data: a.data } });
+      }
+    }
+    if (!parts.length) parts.push({ text: " " });
+    return { role: m.role === "assistant" ? "model" : "user", parts };
+  });
 }
 
 function errorMessage(status, detail) {
@@ -130,8 +162,10 @@ function errorMessage(status, detail) {
     return "La API key no es válida. Revisa que la pegaste completa en clave.txt.";
   }
   if (status === 403) return "Esta API key no tiene permiso. Genera una nueva en aistudio.google.com.";
+  if (status === 400) return "Google no pudo procesar ese mensaje o archivo. Prueba con otro archivo o uno más pequeño.";
   if (status === 404) return "El modelo no existe. Cambia la variable MODEL.";
   if (status === 429) return "Se alcanzó el límite gratuito por ahora. Espera un momento o intenta más tarde.";
+  if (status === 500 || status === 502 || status === 503 || status === 504) return "Google tiene mucha demanda en este momento. Intenta de nuevo en unos segundos.";
   return "George IA no pudo responder. Intenta de nuevo.";
 }
 
@@ -195,7 +229,7 @@ async function handleChat(req, res) {
       lastStatus = response.status;
       lastDetail = await response.text();
       console.error("Error de la API:", model, lastStatus, lastDetail.slice(0, 300));
-      if (lastStatus !== 404 && lastStatus !== 429) break;
+      if (![404, 429, 500, 502, 503, 504].includes(lastStatus)) break;
     }
 
     if (!upstream) {
